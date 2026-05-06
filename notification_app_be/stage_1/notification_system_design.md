@@ -520,3 +520,104 @@ RETURNING user_id, updated_at;
 
 ---
 
+# Stage 3
+
+## Query Given
+
+```sql
+SELECT *
+FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC;
+```
+
+## 1) Is this query accurate?
+
+Partially accurate.
+
+- If your table is denormalized (one row per student-notification), it can return unread rows for one student.
+- For the Stage 1/Stage 2 design (`notifications` + `user_notifications`), this query is not accurate because unread state belongs in `user_notifications`, not in `notifications`.
+- It also misses practical filters like `is_archived = false`, `status = 'published'`, and pagination.
+
+## 2) Why is this slow?
+
+At 5,000,000 rows, this can be slow due to:
+
+- No composite index matching both filter and sort.
+- `SELECT *` forces wider row reads.
+- Sorting can become expensive if rows are not already in index order.
+- Returning very large unread sets without `LIMIT` increases I/O and memory cost.
+
+## 3) What should be changed?
+
+### A) Query shape
+
+Use projected columns and pagination:
+
+```sql
+SELECT id, notificationType, title, message, createdAt
+FROM notifications
+WHERE studentID = $1
+  AND isRead = false
+ORDER BY createdAt DESC
+LIMIT 50;
+```
+
+### B) Index strategy
+
+For PostgreSQL (best with partial index on unread rows):
+
+```sql
+CREATE INDEX CONCURRENTLY idx_notifications_student_unread_created
+ON notifications (studentID, createdAt DESC)
+WHERE isRead = false;
+```
+
+For MySQL (no partial index, use composite index):
+
+```sql
+CREATE INDEX idx_notifications_student_read_created
+ON notifications (studentID, isRead, createdAt DESC);
+```
+
+### C) Likely computation cost
+
+- Without proper index: close to full scan + sort behavior (`O(N)` scan, often `O(M log M)` sort on matched rows).
+- With proper composite index: index seek + ordered range scan (`O(log N + K)`), where `K` is returned rows.
+
+## 4) Should we add indexes on every column?
+
+No. That advice is not effective.
+
+- Every extra index slows `INSERT/UPDATE/DELETE` (write amplification).
+- Indexes consume RAM and disk.
+- Single-column indexes often do not help multi-condition + sorted queries as much as one correct composite index.
+- You should index based on real query patterns, not "every column just in case".
+
+## 5) Query: students who got Placement notifications in last 7 days
+
+### If using the prompt's single-table model (`notificationType` enum with `Placement`)
+
+```sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+
+### If using Stage 1/2 normalized schema (`notifications` + `user_notifications`)
+
+```sql
+SELECT DISTINCT un.user_id AS student_id
+FROM user_notifications un
+JOIN notifications n ON n.id = un.notification_id
+WHERE n.type = 'placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days'
+  AND un.is_archived = false;
+```
+
+## 6) Extra optimization note for scale
+
+As data grows further, use keyset pagination instead of deep offsets for notification timelines.
+
+
