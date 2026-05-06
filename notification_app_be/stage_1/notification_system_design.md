@@ -126,4 +126,168 @@ Link: <next-page-link-if-available>
   "updatedAt": "2026-05-06T10:30:00Z"
 }
 ```
+---
+
+## 5) Endpoint Contracts
+
+## 5.1 Create Notification
+
+`POST /api/v1/notifications`
+
+---
+
+## 5.2 List Notifications for User
+
+`GET /api/v1/notifications?type=placement&isRead=false&page=1&limit=20`
+
+### Success Response (200)
+
+---
+
+## 5.3 Get Notification by Id
+
+`GET /api/v1/notifications/{notificationId}`
+
+---
+
+## 5.4 Mark Single Notification as Read
+
+`PATCH /api/v1/notifications/{notificationId}/read`
+
+### Request Body
+
+```json
+{
+  "isRead": true
+}
+```
+
+---
+
+## 5.5 Mark All as Read
+
+`PATCH /api/v1/notifications/read-all`
+
+### Request Body
+
+```json
+{
+  "type": "all"
+}
+```
+---
+
+## 5.6 Archive/Delete Notification for User
+
+`DELETE /api/v1/notifications/{notificationId}`
+
+### Success Response (200)
+
+```json
+{
+  "message": "Notification archived for user"
+}
+```
+
+---
+
+## 5.7 Get Preferences
+
+`GET /api/v1/users/me/notification-preferences`
+
+---
+
+## 5.8 Update Preferences
+
+`PUT /api/v1/users/me/notification-preferences`
+
+### Request Body
+
+```json
+{
+  "channels": {
+    "inApp": true,
+    "email": false,
+    "sms": false
+  },
+  "types": {
+    "placement": true,
+    "event": true,
+    "result": true,
+    "general": false
+  },
+  "quietHours": {
+    "enabled": true,
+    "start": "23:00",
+    "end": "06:00",
+    "timezone": "Asia/Kolkata"
+  }
+}
+```
+---
+
+## 6) Error Response Contract
+
+All endpoints return this structure on error:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "type must be one of placement,event,result,general",
+    "details": [
+      {
+        "field": "type",
+        "issue": "invalid value"
+      }
+    ]
+  }
+}
+```
+
+Suggested error codes:
+
+- `VALIDATION_ERROR` (400)
+- `UNAUTHORIZED` (401, only if upstream auth fails)
+- `FORBIDDEN` (403)
+- `NOT_FOUND` (404)
+- `CONFLICT` (409)
+- `RATE_LIMITED` (429)
+- `INTERNAL_ERROR` (500)
+
+---
+
+## 7) Real-Time Notification Mechanism
+
+Use WebSocket for live in-app updates.
+
+### WebSocket Endpoint
+
+`GET /api/v1/realtime/notifications/ws`
+
+### Handshake Headers
+
+```http
+Upgrade: websocket
+Connection: Upgrade
+X-User-Id: <uuid>
+X-Request-Id: <uuid>
+```
+
+### Server-to-Client Event Format
+
+```json
+{
+  "event": "notification.created",
+  "timestamp": "2026-05-06T10:30:01Z",
+  "data": {
+    "id": "f2aa9aa3-96fc-4ab6-b0dc-b2dc0f9f09a2",
+    "type": "placement",
+    "title": "Placement drive: ABC Corp",
+    "message": "Registration closes on 10 May, 5 PM",
+    "priority": "high"
+  }
+}
+```
+---
 
