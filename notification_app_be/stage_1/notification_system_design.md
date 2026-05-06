@@ -291,3 +291,232 @@ X-Request-Id: <uuid>
 ```
 ---
 
+# Stage 2
+
+## 1) Suggested Persistent Storage
+
+I suggest **PostgreSQL** as the primary database.
+
+Why this fits the Stage 1 APIs:
+- Notification and user-read states are relational and query-heavy (filter by user, type, read status, time).
+- We need strong consistency for actions like mark-read, mark-all-read, archive, and preference updates.
+- PostgreSQL supports JSONB for flexible `metadata` and `audience` fields without losing SQL power.
+- Mature indexing and partitioning features help as data volume grows.
+
+---
+
+## 2) Applicable DB Schema (SQL)
+
+```sql
+CREATE TYPE notification_type AS ENUM ('placement', 'event', 'result', 'general');
+CREATE TYPE priority_type AS ENUM ('low', 'medium', 'high');
+CREATE TYPE notification_status AS ENUM ('draft', 'published', 'cancelled');
+
+CREATE TABLE notifications (
+  id UUID PRIMARY KEY,
+  type notification_type NOT NULL,
+  title VARCHAR(160) NOT NULL,
+  message TEXT NOT NULL,
+  priority priority_type NOT NULL DEFAULT 'medium',
+  audience JSONB NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status notification_status NOT NULL DEFAULT 'published',
+  created_by VARCHAR(80) NOT NULL,
+  publish_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE user_notifications (
+  user_id UUID NOT NULL,
+  notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+  is_read BOOLEAN NOT NULL DEFAULT FALSE,
+  read_at TIMESTAMPTZ,
+  is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+  delivered_channels TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  delivered_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, notification_id)
+);
+
+CREATE TABLE notification_preferences (
+  user_id UUID PRIMARY KEY,
+  channels JSONB NOT NULL,
+  types JSONB NOT NULL,
+  quiet_hours JSONB NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### Recommended Indexes
+
+```sql
+CREATE INDEX idx_notifications_created_at ON notifications (created_at DESC);
+CREATE INDEX idx_notifications_type_status_created ON notifications (type, status, created_at DESC);
+
+CREATE INDEX idx_user_notifications_user_unread_created
+  ON user_notifications (user_id, is_read, is_archived, created_at DESC);
+
+CREATE INDEX idx_user_notifications_user_notification
+  ON user_notifications (user_id, notification_id);
+
+CREATE INDEX idx_notifications_audience_gin ON notifications USING GIN (audience);
+CREATE INDEX idx_notifications_metadata_gin ON notifications USING GIN (metadata);
+```
+
+---
+
+## 3) Scale Problems as Data Grows and Solutions
+
+### Problem A: Very large `user_notifications` table
+- Cause: one notification can fan out to many users.
+- Solution:
+  - Partition `user_notifications` by month (`created_at`) or hash (`user_id`) based on traffic pattern.
+  - Add retention policy (archive/purge rows older than policy window).
+
+### Problem B: Slow list APIs (`GET /notifications`) at high volume
+- Cause: deep offset pagination + mixed filters.
+- Solution:
+  - Use keyset pagination (`created_at`, `notification_id`) instead of large offsets.
+  - Keep covering indexes for most common filter combinations.
+
+### Problem C: Write spikes during bulk publish
+- Cause: high fan-out inserts to `user_notifications`.
+- Solution:
+  - Batch inserts.
+  - Use async worker queue for fan-out.
+  - Keep transaction size controlled (chunk users).
+
+### Problem D: Heavy JSON filter queries
+- Cause: unindexed JSONB access patterns.
+- Solution:
+  - GIN indexes on JSONB columns.
+  - Promote frequently filtered JSON keys into typed columns when patterns stabilize.
+
+### Problem E: Real-time + API consistency gaps
+- Cause: websocket push may happen before durable write confirmation.
+- Solution:
+  - Write first to DB, then publish event from an outbox/queue worker.
+  - Retry failed pushes and rely on list API for eventual sync.
+
+---
+
+## 4) SQL Queries Mapped to APIs
+
+### 4.1 Create Notification (`POST /notifications`)
+
+```sql
+INSERT INTO notifications (
+  id, type, title, message, priority, audience, metadata, status, created_by, publish_at
+)
+VALUES (
+  $1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, 'published', $8, $9
+)
+RETURNING id, status, created_at;
+```
+
+### 4.2 Fan-out to target users (background step)
+
+```sql
+INSERT INTO user_notifications (user_id, notification_id, delivered_channels, delivered_at)
+SELECT u.user_id, $1, ARRAY['in_app']::text[], NOW()
+FROM target_users u
+ON CONFLICT (user_id, notification_id) DO NOTHING;
+```
+
+### 4.3 List Notifications (`GET /notifications`)
+
+```sql
+SELECT
+  n.id, n.type, n.title, n.message, n.priority,
+  un.is_read, n.created_at
+FROM user_notifications un
+JOIN notifications n ON n.id = un.notification_id
+WHERE un.user_id = $1
+  AND un.is_archived = FALSE
+  AND ($2::notification_type IS NULL OR n.type = $2)
+  AND ($3::boolean IS NULL OR un.is_read = $3)
+  AND n.status = 'published'
+ORDER BY n.created_at DESC, n.id DESC
+LIMIT $4 OFFSET $5;
+```
+
+### 4.4 Get by Id (`GET /notifications/{id}`)
+
+```sql
+SELECT
+  n.id, n.type, n.title, n.message, n.priority, n.metadata,
+  un.is_read, n.created_at
+FROM user_notifications un
+JOIN notifications n ON n.id = un.notification_id
+WHERE un.user_id = $1
+  AND n.id = $2
+  AND un.is_archived = FALSE
+LIMIT 1;
+```
+
+### 4.5 Mark one as read (`PATCH /notifications/{id}/read`)
+
+```sql
+UPDATE user_notifications
+SET is_read = TRUE,
+    read_at = NOW(),
+    updated_at = NOW()
+WHERE user_id = $1
+  AND notification_id = $2
+  AND is_archived = FALSE
+RETURNING user_id, notification_id, is_read, read_at;
+```
+
+### 4.6 Mark all as read (`PATCH /notifications/read-all`)
+
+```sql
+UPDATE user_notifications un
+SET is_read = TRUE,
+    read_at = NOW(),
+    updated_at = NOW()
+FROM notifications n
+WHERE un.notification_id = n.id
+  AND un.user_id = $1
+  AND un.is_archived = FALSE
+  AND un.is_read = FALSE
+  AND ($2::notification_type IS NULL OR n.type = $2)
+RETURNING un.notification_id;
+```
+
+### 4.7 Archive/Delete for user (`DELETE /notifications/{id}` as soft delete)
+
+```sql
+UPDATE user_notifications
+SET is_archived = TRUE,
+    updated_at = NOW()
+WHERE user_id = $1
+  AND notification_id = $2
+RETURNING user_id, notification_id, is_archived;
+```
+
+### 4.8 Get preferences (`GET /users/me/notification-preferences`)
+
+```sql
+SELECT user_id, channels, types, quiet_hours, updated_at
+FROM notification_preferences
+WHERE user_id = $1;
+```
+
+### 4.9 Update preferences (`PUT /users/me/notification-preferences`)
+
+```sql
+INSERT INTO notification_preferences (user_id, channels, types, quiet_hours, updated_at)
+VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, NOW())
+ON CONFLICT (user_id)
+DO UPDATE SET
+  channels = EXCLUDED.channels,
+  types = EXCLUDED.types,
+  quiet_hours = EXCLUDED.quiet_hours,
+  updated_at = NOW()
+RETURNING user_id, updated_at;
+```
+
+---
+
