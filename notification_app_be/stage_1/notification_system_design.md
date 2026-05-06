@@ -679,6 +679,183 @@ ON notifications (status, type, created_at DESC);
 
 
 
+# Stage 5
+
+## Shortcomings in the Proposed `notify_all`
+
+Given pseudocode:
+
+```text
+for each student:
+  send_email
+  save_to_db
+  push_to_app
+```
+
+Main issues:
+
+1. **Sequential and slow**: 50,000 users x network calls in a loop leads to very high total latency.
+2. **No fault isolation**: if email fails midway (for 200 students), flow becomes partially completed and hard to recover.
+3. **No idempotency**: retries can send duplicate emails/notifications.
+4. **No delivery state tracking**: cannot answer who got email, who got in-app, and who needs retry.
+5. **Tight coupling**: DB write and external email API call in the same synchronous path reduces reliability.
+6. **No backpressure/rate control**: email provider limits can cause burst failures.
+
+---
+
+## What to Do When Email Failed for 200 Students Midway
+
+Do **not** restart the whole broadcast. Retry only failed recipients.
+
+- Maintain per-recipient delivery status (`pending`, `sent`, `failed`, `retrying`, `dead_letter`).
+- Use retry with exponential backoff + max attempts.
+- Keep idempotency key: `(campaign_id, student_id, channel)`.
+- Move exhausted failures to DLQ for manual/automated replay.
+
+---
+
+## Should DB save and email sending happen together?
+
+Not as one distributed transaction.
+
+- DB and Email API are separate systems; a single ACID transaction across both is not practical.
+- If you "send email first then DB fails", delivery is untracked.
+- If you "DB first then email fails", you can safely retry from persisted state.
+
+Correct pattern: **Transactional Outbox + Async Workers**.
+
+1. In one DB transaction, persist notification and outbox events.
+2. Commit transaction.
+3. Workers read outbox and send email / push in parallel.
+4. Update delivery status and retry failures safely.
+
+---
+
+## Reliable and Fast Redesign
+
+### High-level flow
+
+1. Create `campaign` record.
+2. Insert in-app notification records for recipients (batched).
+3. Insert channel jobs into outbox (`email`, `in_app`).
+4. Background workers process outbox concurrently.
+5. Real-time channel pushes in-app updates via WebSocket from worker events.
+6. API returns quickly with `campaign_id` and accepted count.
+
+### Data entities to track
+
+- `notification_campaigns`
+- `user_notifications`
+- `notification_deliveries` (per user, per channel status)
+- `outbox_events`
+
+---
+
+## Revised Pseudocode
+
+```python
+def notify_all(student_ids: list[str], message: str, actor_id: str) -> dict:
+    campaign_id = uuid4()
+
+    # 1) Durable write first (single DB transaction)
+    with db.transaction():
+        db.insert("notification_campaigns", {
+            "campaign_id": campaign_id,
+            "message": message,
+            "created_by": actor_id,
+            "status": "accepted"
+        })
+
+        # batched inserts for scale
+        for batch in chunk(student_ids, 1000):
+            db.bulk_insert("user_notifications", [
+                {
+                    "campaign_id": campaign_id,
+                    "student_id": sid,
+                    "message": message,
+                    "is_read": False,
+                    "is_archived": False
+                }
+                for sid in batch
+            ])
+
+            db.bulk_insert("notification_deliveries", [
+                {
+                    "campaign_id": campaign_id,
+                    "student_id": sid,
+                    "channel": "email",
+                    "status": "pending",
+                    "attempt_count": 0
+                }
+                for sid in batch
+            ] + [
+                {
+                    "campaign_id": campaign_id,
+                    "student_id": sid,
+                    "channel": "in_app",
+                    "status": "pending",
+                    "attempt_count": 0
+                }
+                for sid in batch
+            ])
+
+            db.bulk_insert("outbox_events", [
+                {
+                    "event_type": "SEND_EMAIL",
+                    "idempotency_key": f"{campaign_id}:{sid}:email",
+                    "payload": {"campaign_id": campaign_id, "student_id": sid, "message": message}
+                }
+                for sid in batch
+            ] + [
+                {
+                    "event_type": "PUSH_IN_APP",
+                    "idempotency_key": f"{campaign_id}:{sid}:in_app",
+                    "payload": {"campaign_id": campaign_id, "student_id": sid, "message": message}
+                }
+                for sid in batch
+            ])
+
+    # 2) Return fast; async workers do actual delivery
+    return {
+        "campaign_id": str(campaign_id),
+        "accepted_recipients": len(student_ids),
+        "status": "processing"
+    }
+
+
+def worker_process_outbox(event):
+    # idempotency check
+    if already_processed(event.idempotency_key):
+        mark_outbox_done(event)
+        return
+
+    try:
+        if event.event_type == "SEND_EMAIL":
+            email_provider.send(event.payload["student_id"], event.payload["message"])
+            mark_delivery_sent(event.payload["campaign_id"], event.payload["student_id"], "email")
+
+        elif event.event_type == "PUSH_IN_APP":
+            websocket_hub.push(event.payload["student_id"], {
+                "event": "notification.created",
+                "message": event.payload["message"],
+                "campaign_id": event.payload["campaign_id"]
+            })
+            mark_delivery_sent(event.payload["campaign_id"], event.payload["student_id"], "in_app")
+
+        mark_processed(event.idempotency_key)
+        mark_outbox_done(event)
+
+    except TemporaryError:
+        schedule_retry(event, backoff="exponential", max_attempts=5)
+        mark_delivery_retrying(event)
+
+    except Exception:
+        mark_delivery_failed(event)
+        send_to_dlq(event)
+```
+
+---
+
 
 
 
