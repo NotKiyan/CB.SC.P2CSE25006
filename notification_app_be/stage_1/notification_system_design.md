@@ -620,4 +620,65 @@ WHERE n.type = 'placement'
 
 As data grows further, use keyset pagination instead of deep offsets for notification timelines.
 
+# Stage 4
+
+Fetching notifications from DB on every page load for every student creates repeated hot reads, high DB CPU, and high query latency.
+
+## Proposed Solution
+
+Use a layered approach instead of only scaling the database vertically.
+
+### 1) Cache-first timeline reads
+
+- Keep a per-user notification feed cache in Redis (for example: `notif:feed:{userId}`).
+- API read flow:
+  1. Try Redis first.
+  2. If miss, fetch from DB, hydrate cache with short TTL, return response.
+- Invalidate/update cache when notification state changes (new notification, read, archive, mark-all-read).
+
+**Tradeoff:**
+- Pros: major DB offload, faster p95 latency.
+- Cons: cache invalidation complexity, possible temporary staleness.
+
+### 2) Push model using WebSocket/SSE
+
+- Do not rely only on page-load polling.
+- After initial fetch, deliver new notifications in real time via WebSocket (`notification.created`, `notification.read.updated`).
+- Client updates local state incrementally.
+
+**Tradeoff:**
+- Pros: fewer repeated API hits, better UX (real-time).
+- Cons: connection management overhead, need reconnect/heartbeat logic.
+
+### 3) Query/index optimization in DB
+
+- Keep unread and timeline queries on optimized indexes.
+- For normalized design from Stage 2:
+
+```sql
+CREATE INDEX idx_un_user_arch_read_created
+ON user_notifications (user_id, is_archived, is_read, created_at DESC);
+
+CREATE INDEX idx_n_status_type_created
+ON notifications (status, type, created_at DESC);
+```
+
+**Tradeoff:**
+- Pros: lower query latency without architecture change.
+- Cons: more indexes increase write cost and storage.
+
+### 4) Precomputed counters and fan-out workers
+
+- Maintain `unread_count` per user in Redis or a compact table.
+- Use background workers/queue for heavy fan-out writes and cache refresh.
+
+**Tradeoff:**
+- Pros: quick badge/count API, smoother write spikes.
+- Cons: eventual consistency window; operational complexity.
+
+
+
+
+
+
 
